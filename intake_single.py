@@ -1,175 +1,219 @@
 """
 Flujo:
-  1. extract_pages  — extrae texto por página con PyMuPDF
-  2. chunk_pages    — fragmenta preservando solapamiento semántico
-  3. ingest         — orquesta embeddings + upsert en lotes
+  1. retrieve  — embed query + búsqueda Qdrant + reranking híbrido + filtro
+  2. generate  — construye prompt con contexto e invoca el LLM
+  3. ask       — orquesta ambas fases y devuelve la respuesta final
 """
 
-import os
-import uuid
-import hashlib
+import re
+import time
 
-import fitz 
 import ollama
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
 
 import config
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. EXTRACCIÓN
+# 1. RETRIEVAL
 # ─────────────────────────────────────────────────────────────
 
-def extract_pages(pdf_path: str) -> list[dict]:
-    """
-    Abre el PDF y extrae el texto de cada página.
-    Retorna: [{"page": 1, "text": "..."}, ...]
-    """
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF no encontrado: {pdf_path}")
-    doc = fitz.open(pdf_path)
-    return [{"page": i + 1, "text": page.get_text()} for i, page in enumerate(doc)]
-
-
-def pdf_hash(pdf_path: str) -> str:
-    """
-    Genera un SHA-256 del archivo binario.
-    Útil como identificador estable del documento.
-    """
-    h = hashlib.sha256()
-    with open(pdf_path, "rb") as f:
-        while chunk := f.read(8192):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-# ─────────────────────────────────────────────────────────────
-# 2. CHUNKING
-# ─────────────────────────────────────────────────────────────
-
-def chunk_pages(pages: list[dict]) -> list[dict]:
-    """
-    Divide cada página en fragmentos de tamaño controlado.
-
-    El solapamiento (chunk_overlap) preserva contexto entre chunks
-    consecutivos, evitando que una idea quede truncada en el borde.
-    Retorna: [{"page": 1, "chunk_index": 0, "content": "..."}, ...]
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=config.CHUNK_SIZE,
-        chunk_overlap=config.CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""]
+def embed_query(query: str) -> list[float]:
+    """Vectoriza la consulta."""
+    resp = ollama.embeddings(
+        model=config.EMBED_MODEL,
+        prompt=query
     )
-    chunks = []
-    for page in pages:
-        for idx, text in enumerate(splitter.split_text(page["text"])):
-            chunks.append({
-                "page":        page["page"],
-                "chunk_index": idx,
-                "content":     text,
-            })
+    return resp["embedding"]
+
+
+def search_qdrant(vector: list[float], collection: str) -> list:
+    """Busca los fragmentos más similares."""
+    client = QdrantClient(
+        host=config.QDRANT_HOST,
+        port=config.QDRANT_PORT
+    )
+
+    result = client.query_points(
+        collection_name=collection,
+        query=vector,
+        limit=config.RETRIEVAL_LIMIT
+    )
+
+    return result.points
+
+
+def hybrid_rerank(hits: list, query: str) -> list[dict]:
+    """
+    Score semántico + bonus lexical.
+    """
+
+    terms = [
+        w for w in re.findall(r"\w+", query.lower())
+        if len(w) > 3
+    ]
+
+    scored = []
+
+    for hit in hits:
+
+        content = hit.payload.get("content", "")
+
+        bonus = sum(
+            config.LEXICAL_BONUS
+            for term in terms
+            if term in content.lower()
+        )
+
+        scored.append(
+            {
+                "source": hit.payload.get("source", "?"),
+                "content": content,
+                "similarity": hit.score + bonus
+            }
+        )
+
+    scored.sort(
+        key=lambda x: x["similarity"],
+        reverse=True
+    )
+
+    return [
+        chunk
+        for chunk in scored
+        if chunk["similarity"] >= config.SCORE_THRESHOLD
+    ]
+
+
+def retrieve(
+    query: str,
+    collection: str = config.COLLECTION_NAME
+) -> list[dict]:
+
+    t0 = time.perf_counter()
+
+    vector = embed_query(query)
+
+    hits = search_qdrant(
+        vector,
+        collection
+    )
+
+    chunks = hybrid_rerank(
+        hits,
+        query
+    )
+
+    print(
+        f"[RETRIEVAL] "
+        f"{len(chunks)} chunks relevantes "
+        f"({time.perf_counter() - t0:.2f}s)"
+    )
+
     return chunks
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. QDRANT — COLECCIÓN
+# 2. GENERATION
 # ─────────────────────────────────────────────────────────────
 
-def ensure_collection(client: QdrantClient, name: str) -> None:
-    """Crea la colección si no existe. No hace nada si ya está creada."""
-    if not client.collection_exists(name):
-        print(f"  → Creando colección '{name}'...")
-        client.create_collection(
-            collection_name=name,
-            vectors_config=VectorParams(
-                size=config.VECTOR_SIZE,
-                distance=Distance.COSINE
-            )
+def build_context(chunks: list[dict]) -> str:
+    """Construye el contexto para el LLM."""
+
+    lines = []
+
+    for i, chunk in enumerate(chunks, start=1):
+
+        lines.append(
+            f"--- Fragmento {i} "
+            f"(fuente: {chunk['source']}) ---"
         )
 
+        lines.append(chunk["content"])
 
-# ─────────────────────────────────────────────────────────────
-# 4. PIPELINE PRINCIPAL
-# ─────────────────────────────────────────────────────────────
+    return "\n".join(lines)
 
-def ingest(pdf_path: str, collection: str = config.COLLECTION_NAME, batch_size: int = 50) -> None:
-    """
-    Pipeline completo de ingesta para un único PDF.
 
-    El upsert en lotes (batch_size) evita timeouts y exceso de memoria
-    en documentos grandes. uuid.NAMESPACE_URL genera IDs determinísticos
-    y semánticamente correctos para contenido no-DNS.
-    """
-    filename = os.path.basename(pdf_path)
-    doc_hash = pdf_hash(pdf_path)
-    print(f"\n[INGEST] {filename}  (hash: {doc_hash[:12]}...)")
+def generate(
+    query: str,
+    chunks: list[dict]
+) -> str:
 
-    # Paso 1 — Extracción
-    pages  = extract_pages(pdf_path)
-    print(f"  → {len(pages)} páginas extraídas")
+    system = (
+        "Eres un asistente de recuperación documental. "
+        "Responde únicamente usando el contexto proporcionado. "
+        "Si la respuesta no está en el contexto responde: "
+        "'No encontré esa información en los documentos.'"
+    )
 
-    # Paso 2 — Chunking semántico
-    chunks = chunk_pages(pages)
-    print(f"  → {len(chunks)} chunks generados")
+    user = (
+        f"Contexto:\n{build_context(chunks)}\n\n"
+        f"Pregunta: {query}\n\n"
+        f"Respuesta:"
+    )
 
-    # Paso 3 — Conexión y colección
-    client = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT)
-    ensure_collection(client, collection)
+    t0 = time.perf_counter()
 
-    # Paso 4 — Embeddings → PointStruct
-    # El prefijo "search_document:" es el prompt instructivo de nomic-embed-text
-    print(f"  → Generando embeddings con '{config.EMBED_MODEL}'...")
-    points = []
-    for chunk in chunks:
-        resp = ollama.embeddings(
-            model=config.EMBED_MODEL,
-            prompt=f"search_document: {chunk['content']}"
-        )
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, filename + chunk["content"]))
-        points.append(PointStruct(
-            id=point_id,
-            vector=resp["embedding"],
-            payload={
-                "source":        filename,
-                "document_hash": doc_hash,
-                "page":          chunk["page"],
-                "chunk_index":   chunk["chunk_index"],
-                "content":       chunk["content"],
+    response = ollama.chat(
+        model=config.LLM_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": system
+            },
+            {
+                "role": "user",
+                "content": user
             }
-        ))
+        ]
+    )
 
-    # Paso 5 — Upsert en lotes
-    for start in range(0, len(points), batch_size):
-        batch = points[start: start + batch_size]
-        client.upsert(collection_name=collection, points=batch)
-        print(f"  → Subidos puntos {start + 1}–{start + len(batch)}")
+    print(
+        f"[GENERATION] "
+        f"{time.perf_counter() - t0:.2f}s"
+    )
 
-    print(f"[INGEST] ✓ {len(points)} puntos indexados en '{collection}'\n")
+    return response["message"]["content"]
 
 
 # ─────────────────────────────────────────────────────────────
-# HEALTH CHECKS Y PUNTO DE ENTRADA
+# 3. PIPELINE COMPLETO
 # ─────────────────────────────────────────────────────────────
 
-def health_checks() -> None:
-    """Verifica que Qdrant y Ollama respondan antes de arrancar."""
-    print("[CHECK] Qdrant... ", end="", flush=True)
-    QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT, timeout=2).get_collections()
-    print("OK")
+def ask(
+    query: str,
+    collection: str = config.COLLECTION_NAME
+) -> str:
 
-    print("[CHECK] Ollama...  ", end="", flush=True)
-    ollama.list()
-    print("OK\n")
+    chunks = retrieve(
+        query,
+        collection
+    )
 
+    if not chunks:
+        return (
+            "No se encontraron fragmentos "
+            "relevantes para esa pregunta."
+        )
+
+    return generate(
+        query,
+        chunks
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# PUNTO DE ENTRADA
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    PDF_PATH = "./single_document/test.pdf"
 
-    try:
-        health_checks()
-        ingest(pdf_path=PDF_PATH)
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        print("Asegúrate de que Docker y Ollama estén corriendo.")
+    pregunta = input("Pregunta: ")
+
+    print("\nBuscando...\n")
+
+    respuesta = ask(pregunta)
+
+    print("\n" + "=" * 60)
+    print(respuesta)
+    print("=" * 60)
