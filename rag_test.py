@@ -1,153 +1,110 @@
-"""
-Flujo:
-  1. retrieve  — embed query + búsqueda Qdrant + reranking híbrido + filtro
-  2. generate  — construye prompt con contexto e invoca el LLM
-  3. ask       — orquesta ambas fases y devuelve la respuesta final
-"""
-
 import re
 import time
-
+import json
+import urllib.request
+import urllib.error
 import ollama
-from qdrant_client import QdrantClient
-
 import config
 
+QDRANT_URL = f"http://{config.QDRANT_HOST}:{config.QDRANT_PORT}"
 
-# ─────────────────────────────────────────────────────────────
-# 1. RETRIEVAL
-# ─────────────────────────────────────────────────────────────
+def qdrant_post(endpoint: str, data: dict):
+    """Envia peticiones POST directas a Qdrant usando Python nativo."""
+    url = f"{QDRANT_URL}{endpoint}"
+    req = urllib.request.Request(url, method="POST")
+    req.add_header('Content-Type', 'application/json')
+    jsondata = json.dumps(data).encode('utf-8')
+    with urllib.request.urlopen(req, data=jsondata) as response:
+        return json.loads(response.read().decode('utf-8'))
 
 def embed_query(query: str) -> list[float]:
-    """
-    Vectoriza la pregunta con el prefijo instructivo correcto.
-    nomic-embed-text distingue entre "search_query" (consulta)
-    y "search_document" (ingesta) para mejorar la similitud.
-    """
+    """Genera vector de consulta usando Ollama."""
     resp = ollama.embeddings(model=config.EMBED_MODEL, prompt=f"search_query: {query}")
     return resp["embedding"]
 
+def retrieve(query: str, collection: str) -> list[dict]:
+    """Recupera y reordena fragmentos mediante la API REST de Qdrant."""
+    t0 = time.perf_counter()
+    query_vector = embed_query(query)
 
-def search_qdrant(vector: list[float], collection: str) -> list:
-    """Búsqueda semántica: devuelve los N hits más similares de Qdrant."""
-    client = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT)
-    result = client.query_points(
-        collection_name=collection,
-        query=vector,
-        limit=config.RETRIEVAL_LIMIT
-    )
-    return result.points
+    search_payload = {
+        "vector": query_vector,
+        "limit": config.RETRIEVAL_LIMIT,
+        "with_payload": True
+    }
+    
+    response = qdrant_post(f"/collections/{collection}/points/query", data=search_payload)
+    hits = response.get("result", {}).get("points", [])
 
+    query_words = set(re.findall(r'\w+', query.lower()))
+    reranked = []
 
-def hybrid_rerank(hits: list, query: str) -> list[dict]:
-    """
-    Reranking híbrido = score semántico (Qdrant) + bonus lexical.
-
-    El bonus premia chunks que contienen los mismos términos de la pregunta,
-    compensando casos donde la similitud semántica no captura palabras clave exactas.
-    El filtro por SCORE_THRESHOLD se aplica aquí, antes de cualquier salida.
-    """
-    terms = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 3]
-
-    scored = []
     for hit in hits:
-        content = hit.payload.get("content", "")
-        bonus   = sum(config.LEXICAL_BONUS for t in terms if t in content.lower())
-        scored.append({
-            "source":     hit.payload.get("source", "?"),
-            "page":       hit.payload.get("page"),
-            "content":    content,
-            "similarity": hit.score + bonus,
+        payload = hit.get("payload", {})
+        # Usamos 'content' para emparejar con tu script de intake.py
+        content = payload.get("content", "")
+        content_lower = content.lower()
+        score = hit.get("score", 0.0)
+
+        # Incremento automático por coincidencia de palabras (para cualquier recurso)
+        bonus = sum(config.LEXICAL_BONUS for word in query_words if word in content_lower)
+        final_score = score + bonus
+
+        reranked.append({
+            "score": final_score,
+            "content": content,
+            "source": payload.get("source", "Desconocido")
         })
 
-    scored.sort(key=lambda x: x["similarity"], reverse=True)
-    return [c for c in scored if c["similarity"] >= config.SCORE_THRESHOLD]
+    filtered = [c for c in reranked if c["score"] >= config.SCORE_THRESHOLD]
+    sorted_chunks = sorted(filtered, key=lambda x: x["score"], reverse=True)
 
-
-def retrieve(query: str, collection: str = config.COLLECTION_NAME) -> list[dict]:
-    """
-    Orquesta el proceso completo de recuperación:
-      embed → search → rerank → filter
-    Devuelve los chunks relevantes listos para el generador.
-    """
-    t0     = time.perf_counter()
-    vector = embed_query(query)
-    hits   = search_qdrant(vector, collection)
-    chunks = hybrid_rerank(hits, query)
-    print(f"[RETRIEVAL] {len(chunks)} chunks relevantes  ({time.perf_counter() - t0:.2f}s)")
-    return chunks
-
-
-# ─────────────────────────────────────────────────────────────
-# 2. GENERATION
-# ─────────────────────────────────────────────────────────────
-
-def build_context(chunks: list[dict]) -> str:
-    """
-    Ensambla los chunks recuperados en un bloque de texto estructurado.
-    La fuente y página dan trazabilidad al LLM sobre el origen del contexto.
-    """
-    lines = []
-    for i, c in enumerate(chunks, 1):
-        lines.append(f"--- Fragmento {i} (fuente: {c['source']}, p.{c['page']}) ---")
-        lines.append(c["content"])
-    return "\n".join(lines)
-
+    print(f"[RETRIEVAL] {len(sorted_chunks)} chunks válidos procesados en {time.perf_counter() - t0:.2f}s")
+    return sorted_chunks
 
 def generate(query: str, chunks: list[dict]) -> str:
-    """
-    Construye el prompt RAG e invoca el LLM.
+    """Genera respuesta usando Ollama optimizado para Gemma 2."""
+    context_blocks = []
+    for i, chunk in enumerate(chunks, 1):
+        context_blocks.append(f"--- Fragmento {i} (Origen: {chunk['source']}) ---\n{chunk['content']}")
+    context = "\n\n".join(context_blocks)
 
-    El sistema obliga a responder SÓLO con el contexto recuperado,
-    evitando que el modelo complete con conocimiento propio.
-    """
+    # El prompt ahora le ordena explícitamente buscar nombres de biomas, recetas o ubicaciones de CUALQUIER elemento
     system = (
-        "Eres un asistente de recuperación documental. "
-        "Responde EXCLUSIVAMENTE con la información presente en el contexto. "
-        "Si la respuesta no aparece allí, di: "
-        "'No encontré esa información en los documentos recuperados.'"
+        "Eres un asistente experto e investigador del juego Subnautica. Tu labor es responder la duda "
+        "del jugador usando los fragmentos de los documentos provistos de forma amigable y muy detallada. "
+        "Menciona nombres de zonas, biomas, coordenadas, recetas de crafteo, fragmentos o afloramientos que aparezcan descritos "
+        "en los textos. Responde siempre en Español de manera natural."
     )
-    user = (
-        f"Contexto recuperado:\n{build_context(chunks)}\n\n"
-        f"Pregunta: {query}\n\nRespuesta:"
-    )
+    user = f"Documentos de investigación recopilados:\n{context}\n\nPregunta del jugador: {query}\n\nRespuesta detallada:"
 
-    t0   = time.perf_counter()
+    t0 = time.perf_counter()
     resp = ollama.chat(
         model=config.LLM_MODEL,
         messages=[
             {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ]
+            {"role": "user",   "content": user}
+        ],
+        options={
+            "temperature": 0.4
+        }
     )
     print(f"[GENERATION] LLM respondió en {time.perf_counter() - t0:.2f}s")
     return resp["message"]["content"]
 
-
-# ─────────────────────────────────────────────────────────────
-# 3. PIPELINE COMPLETO
-# ─────────────────────────────────────────────────────────────
-
 def ask(query: str, collection: str = config.COLLECTION_NAME) -> str:
-    """
-    Función principal del sistema RAG.
-    Recibe una pregunta y devuelve la respuesta generada.
-    """
+    """Función principal RAG."""
     chunks = retrieve(query, collection)
     if not chunks:
-        return "No se encontraron fragmentos relevantes para esa pregunta."
+        return "No encontré registros sobre ese elemento o recurso en los archivos de la enciclopedia local."
     return generate(query, chunks)
 
-
-# ─────────────────────────────────────────────────────────────
-# PUNTO DE ENTRADA
-# ─────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    pregunta = "¿Cómo se llama la ciudad?"
-
-    print(f"Pregunta: {pregunta}\n")
-    respuesta = ask(pregunta)
-    print("\n" + "=" * 60)
-    print(respuesta)
-    print("=" * 60)
+    print("====================================================")
+    print("🤖 MOTOR RAG LOCAL REST - PRUEBA INTERACTIVA")
+    print("====================================================\n")
+    
+    pregunta = input("Introduce tu pregunta sobre el PDF: ")
+    if pregunta.strip():
+        respuesta = ask(pregunta)
+        print(f"\n================ RESPUESTA ================\n{respuesta}\n===========================================")
