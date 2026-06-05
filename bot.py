@@ -8,7 +8,7 @@ import config
 import intake
 import cerebro_rag
 
-TOKEN = "8901909584:AAEp79Bs1PsNa4EvZ3AR-jbQ7fjQfI1t5qI"
+TOKEN = ""
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 DICCIONARIO_SALUDOS = {
